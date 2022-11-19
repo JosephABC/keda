@@ -23,6 +23,7 @@ type kafkaScaler struct {
 	client     sarama.Client
 	admin      sarama.ClusterAdmin
 	logger     logr.Logger
+	prevOffset map[string]map[int32]int64
 }
 
 type kafkaMetadata struct {
@@ -105,12 +106,16 @@ func NewKafkaScaler(config *ScalerConfig) (Scaler, error) {
 		return nil, err
 	}
 
+	prevOffset := make(map[string]map[int32]int64)
+
+
 	return &kafkaScaler{
 		client:     client,
 		admin:      admin,
 		metricType: metricType,
 		metadata:   kafkaMetadata,
 		logger:     logger,
+		prevOffset:  prevOffset,
 	}, nil
 }
 
@@ -432,6 +437,21 @@ func (s *kafkaScaler) getLagForPartition(topic string, partitionID int32, offset
 	if consumerOffset == invalidOffset && s.metadata.offsetResetPolicy == earliest {
 		return latestOffset, nil
 	}
+
+	// This code block tries to prevent KEDA Kafka trigger from scaling the scale target based on errorneous events
+	fmt.Printf("KEDA trigger Consumer offset check\n")
+	if previousOffset, found := s.prevOffset[topic][partitionID]; !found {
+		// No record of previous offset, so store current consumer offset
+		// Allow this consumer lag to be considered in scaling
+		s.prevOffset[topic][partitionID] = consumerOffset
+		fmt.Printf("consumerOffset Set\n")
+	} else if previousOffset == consumerOffset {
+		// since previousOffset same as consumerOffset, consumer is still having trouble consuming the event
+		// return 0, so this consumer lag is not considered for scaling
+		errMsg := fmt.Errorf("Excluding from scaling metric, possibly consumer have trouble consuming this event. Topic %s and partition %d", topic, partitionID)
+		return 0, errMsg
+	}
+
 	return latestOffset - consumerOffset, nil
 }
 

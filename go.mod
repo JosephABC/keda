@@ -81,6 +81,11 @@ require (
 	sigs.k8s.io/kustomize/kustomize/v4 v4.5.7
 )
 
+require (
+	github.com/golang/glog v1.0.0 // indirect
+	github.com/llparse/controller-gen v0.0.0-20180131011002-7a38c4658cb4 // indirect
+)
+
 replace (
 	// we need a version with license
 	github.com/chzyer/logex => github.com/chzyer/logex v1.2.1
