@@ -34,6 +34,7 @@ type kafkaMetadata struct {
 	activationLagThreshold int64
 	offsetResetPolicy      offsetResetPolicy
 	allowIdleConsumers     bool
+	excludePersistentLag   bool
 	version                sarama.KafkaVersion
 
 	// If an invalid offset is found, whether to scale to 1 (false - the default) so consumption can
@@ -260,6 +261,15 @@ func parseKafkaMetadata(config *ScalerConfig, logger logr.Logger) (kafkaMetadata
 		meta.allowIdleConsumers = t
 	}
 
+	meta.excludePersistentLag = false
+	if val, ok := config.TriggerMetadata["excludePersistentLag"]; ok {
+		t, err := strconv.ParseBool(val)
+		if err != nil {
+			return meta, fmt.Errorf("error parsing excludePersistentLag: %s", err)
+		}
+		meta.excludePersistentLag = t
+	}
+
 	meta.scaleToZeroOnInvalidOffset = false
 	if val, ok := config.TriggerMetadata["scaleToZeroOnInvalidOffset"]; ok {
 		t, err := strconv.ParseBool(val)
@@ -438,28 +448,24 @@ func (s *kafkaScaler) getLagForPartition(topic string, partitionID int32, offset
 		return latestOffset, nil
 	}
 
-	// This code block tries to prevent KEDA Kafka trigger from scaling the scale target based on errorneous events
-	// latestOffset: Synonymous with End Offset
-	// consumerOffset: Synonymous with Current Offset
-	if previousOffset, found := s.prevOffset[topic][partitionID]; !found {
-		// No record of previous offset, so store current consumer offset
-		// Allow this consumer lag to be considered in scaling
-		if _, found := s.prevOffset[topic]; !found {
-			s.prevOffset[topic] = map[int32]int64{partitionID: consumerOffset}
+	// This code block tries to prevent KEDA Kafka trigger from scaling the scale target based on erroneous events
+	if s.metadata.excludePersistentLag {
+		if previousOffset, found := s.prevOffset[topic][partitionID]; !found {
+			// No record of previous offset, so store current consumer offset
+			// Allow this consumer lag to be considered in scaling
+			if _, found := s.prevOffset[topic]; !found {
+				s.prevOffset[topic] = map[int32]int64{partitionID: consumerOffset}
+			} else {
+				s.prevOffset[topic][partitionID] = consumerOffset
+			}
+		} else if previousOffset == consumerOffset {
+			// Indicates consumer is still on the same offset as the previous polling cycle, there may be some issue with consuming this offset.
+			// return 0, so this consumer lag is not considered for scaling
+			return 0, nil
 		} else {
+			// Successfully Consumed some messages, proceed to change the previous offset
 			s.prevOffset[topic][partitionID] = consumerOffset
 		}
-		fmt.Printf("consumerOffset Set\n")
-	} else if previousOffset == consumerOffset {
-		// since previousOffset same as consumerOffset, consumer is still having trouble consuming the event
-		// return 0, so this consumer lag is not considered for scaling
-		// errMsg := fmt.Errorf("Excluding from scaling metric, possibly consumer have trouble consuming this event. Topic %s and partition %d", topic, partitionID)
-		fmt.Printf("%s:%d  PreviousOffset: %d, consumerOffset: %d are the SAME!\n", topic, int(partitionID), previousOffset, consumerOffset)
-		return 0, nil
-	} else {
-		// Successfully Consumed some messages, proceed to change the previous offset
-		fmt.Printf("%s:%d  PreviousOffset: %d, consumerOffset: %d are the Different!\n", topic, int(partitionID), int(previousOffset), int(consumerOffset))
-		s.prevOffset[topic][partitionID] = consumerOffset
 	}
 
 	return latestOffset - consumerOffset, nil
@@ -538,8 +544,6 @@ func (s *kafkaScaler) GetMetrics(ctx context.Context, metricName string, metricS
 	}
 	metric := GenerateMetricInMili(metricName, float64(totalLag))
 
-	fmt.Printf("totalLag: %d", int(totalLag))
-
 	return append([]external_metrics.ExternalMetricValue{}, metric), nil
 }
 
@@ -557,13 +561,10 @@ func (s *kafkaScaler) getTotalLag() (int64, error) {
 	totalLag := int64(0)
 	totalTopicPartitions := int64(0)
 
-	fmt.Printf("\n\nNewCycle\n")
-
 	for topic, partitionsOffsets := range producerOffsets {
 		for partition := range partitionsOffsets {
 			lag, _ := s.getLagForPartition(topic, partition, consumerOffsets, producerOffsets)
 			totalLag += lag
-			fmt.Printf("Getting Lag %s:%d, lag: %d, totalLag: %d\n", topic, int(partition), int(lag), int(totalLag))
 		}
 		totalTopicPartitions += (int64)(len(partitionsOffsets))
 	}
